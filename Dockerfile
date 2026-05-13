@@ -1,37 +1,28 @@
-# Use the official uv image for dependency management
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+# Use the official uv image for a more robust build
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 # Set the working directory
 WORKDIR /app
 
 # Enable bytecode compilation
 ENV UV_COMPILE_BYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# Copy dependency files first for better caching
+# Copy dependency files
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies into the virtual environment
-RUN uv sync --frozen --no-install-project --no-dev
-
-# --- Final Stage ---
-FROM python:3.12-slim-bookworm
-
-WORKDIR /app
-
-# Copy the virtual environment from the builder stage
-COPY --from=builder /app/.venv /app/.venv
-
-# Ensure the virtual environment is used
-ENV PATH="/app/.venv/bin:$PATH"
+# Install dependencies system-wide in the container
+# This ensures gunicorn is definitely in the PATH
+RUN uv pip install --system --no-cache -r pyproject.toml
 
 # Copy the application code
 COPY . .
 
-# Railway provides the PORT environment variable
-EXPOSE 5000
-
+# Set environment variables
 ENV FLASK_APP=app.py
-ENV PYTHONUNBUFFERED=1
+
+# Railway dynamically assigns a port
+EXPOSE 5000
 
 # Use gunicorn with the dynamic Railway port
 CMD gunicorn --bind 0.0.0.0:${PORT:-5000} app:app
