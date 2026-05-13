@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.git/
+.gitignore
+.python-version
+.codex/
+README.md
+Dockerfile
+.dockerignore
+.env

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
-import sqlite3
+import os
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 import uuid
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
+import libsql_client
 
 from model import Category, FinanceRecord, PaymentMode, TransactionType
 from queries import (
@@ -21,23 +23,24 @@ from queries import (
     SELECT_RECENT_FINANCE_RECORDS,
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = BASE_DIR / "zapisi.db"
+# Load environment variables from .env if present
+load_dotenv()
+
+TURSO_URL = os.getenv("TURSO_LINK")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_SECRET")
 
 app = Flask(__name__)
 
-
-def get_db_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+def get_db_client():
+    if not TURSO_URL or not TURSO_AUTH_TOKEN:
+        raise RuntimeError("TURSO_LINK and TURSO_SECRET environment variables must be set")
+    return libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
 
 
 def init_db() -> None:
-    with get_db_connection() as connection:
-        connection.execute(CREATE_ACCOUNTS_TABLE)
-        connection.execute(CREATE_FINANCE_RECORDS_TABLE)
+    with get_db_client() as client:
+        client.execute(CREATE_ACCOUNTS_TABLE)
+        client.execute(CREATE_FINANCE_RECORDS_TABLE)
 
 
 def parse_optional_date(raw_value: Any) -> date | None:
@@ -72,28 +75,33 @@ def require_non_empty_string(payload: dict[str, Any], field_name: str) -> str:
     return value
 
 
+def to_dict(result_set: libsql_client.ResultSet) -> list[dict[str, Any]]:
+    """Convert a libsql ResultSet to a list of dictionaries."""
+    dicts = []
+    for row in result_set.rows:
+        dicts.append(dict(zip(result_set.columns, row)))
+    return dicts
+
+
 def fetch_accounts() -> list[dict[str, Any]]:
-    with get_db_connection() as connection:
-        rows = connection.execute(SELECT_ALL_ACCOUNTS).fetchall()
-    return [dict(row) for row in rows]
+    with get_db_client() as client:
+        result = client.execute(SELECT_ALL_ACCOUNTS)
+    return to_dict(result)
 
 
-def serialize_record(row: sqlite3.Row) -> dict[str, Any]:
-    return dict(row)
-
-
-def ensure_account(connection: sqlite3.Connection, account_name: str) -> dict[str, str]:
+def ensure_account(client: libsql_client.Client, account_name: str) -> dict[str, Any]:
     normalized_name = account_name.strip()
-    existing_account = connection.execute(
+    result = client.execute(
         SELECT_ACCOUNT_BY_NAME,
         (normalized_name,),
-    ).fetchone()
-    if existing_account:
-        return dict(existing_account)
+    )
+    accounts = to_dict(result)
+    if accounts:
+        return accounts[0]
 
     today = date.today().isoformat()
     account_id = str(uuid.uuid4())
-    connection.execute(
+    client.execute(
         INSERT_ACCOUNT,
         (account_id, normalized_name, today, today),
     )
@@ -120,8 +128,8 @@ def build_record(payload: dict[str, Any], account_id: str) -> FinanceRecord:
     )
 
 
-def insert_record(connection: sqlite3.Connection, record: FinanceRecord) -> None:
-    connection.execute(
+def insert_record(client: libsql_client.Client, record: FinanceRecord) -> None:
+    client.execute(
         INSERT_FINANCE_RECORD,
         (
             record.id,
@@ -142,20 +150,18 @@ def insert_record(connection: sqlite3.Connection, record: FinanceRecord) -> None
 
 
 def fetch_recent_records(limit: int = 10) -> list[dict[str, Any]]:
-    with get_db_connection() as connection:
-        rows = connection.execute(
+    with get_db_client() as client:
+        result = client.execute(
             SELECT_RECENT_FINANCE_RECORDS,
             (limit,),
-        ).fetchall()
-
-    return [serialize_record(row) for row in rows]
+        )
+    return to_dict(result)
 
 
 def fetch_records() -> list[dict[str, Any]]:
-    with get_db_connection() as connection:
-        rows = connection.execute(SELECT_FINANCE_RECORDS).fetchall()
-
-    return [serialize_record(row) for row in rows]
+    with get_db_client() as client:
+        result = client.execute(SELECT_FINANCE_RECORDS)
+    return to_dict(result)
 
 
 @app.get("/api/bootstrap")
@@ -180,16 +186,16 @@ def create_record():
 
     try:
         account_name = require_non_empty_string(payload, "account_name")
-        with get_db_connection() as connection:
-            account = ensure_account(connection, account_name)
+        with get_db_client() as client:
+            account = ensure_account(client, account_name)
             record = build_record(payload, account["id"])
-            insert_record(connection, record)
+            insert_record(client, record)
     except KeyError as exc:
         return jsonify({"error": f"missing required field: {exc.args[0]}"}), 400
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    except sqlite3.IntegrityError as exc:
-        return jsonify({"error": f"database constraint failed: {exc}"}), 400
+    except Exception as exc:
+        return jsonify({"error": f"database error: {exc}"}), 400
 
     return jsonify(
         {
@@ -222,7 +228,9 @@ def records_page():
     return render_template("records.html")
 
 
-init_db()
+# Only initialize DB if environment variables are present
+if TURSO_URL and TURSO_AUTH_TOKEN:
+    init_db()
 
 
 if __name__ == "__main__":
